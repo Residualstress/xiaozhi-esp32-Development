@@ -9,6 +9,8 @@
 #include <img_converters.h>
 #include <cstring>
 
+#include "app_httpd.h"
+
 #define TAG "Esp32Camera"
 
 Esp32Camera::Esp32Camera(const camera_config_t& config) {
@@ -157,6 +159,11 @@ bool Esp32Camera::SetVFlip(bool enabled) {
     }
     
     ESP_LOGI(TAG, "Camera vertical flip set to: %s", enabled ? "enabled" : "disabled");
+    return true;
+}
+
+bool Esp32Camera::StartStreaming() {
+    startCameraServer();  // 调用外部的 MJPEG 服务器函数
     return true;
 }
 
