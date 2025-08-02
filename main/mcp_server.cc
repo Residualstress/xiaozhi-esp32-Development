@@ -35,6 +35,8 @@ void McpServer::AddCommonTools() {
     auto original_tools = std::move(tools_);
     auto& board = Board::GetInstance();
 
+    
+    
     AddTool("self.get_device_status",
         "Provides the real-time information of the device, including the current status of the audio speaker, screen, battery, network, etc.\n"
         "Use this tool for: \n"
@@ -100,6 +102,18 @@ void McpServer::AddCommonTools() {
                 }
                 auto question = properties["question"].value<std::string>();
                 return camera->Explain(question);
+            });
+        
+        AddTool("self.camera.start_stream",
+            "Start the camera video stream. You can access the MJPEG stream via an HTTP link.\n"
+            "Return: a JSON object containing the stream URL.",
+            PropertyList(),
+            [camera](const PropertyList& properties) -> ReturnValue {
+                if (!camera->StartStreaming()) {
+                    return R"({"success": false, "message": "Failed to start streaming"})";
+                }
+                std::string url = "http://" + WiFi::GetLocalIp() + ":80/stream";
+                return R"({"success": true, "url": ")" + url + R"("})";
             });
     }
 
