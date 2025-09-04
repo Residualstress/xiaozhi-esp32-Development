@@ -11,6 +11,10 @@
 #include "led/led.h"
 #include "backlight.h"
 #include "camera.h"
+#include "audio_codec.h"
+
+// 前向声明
+class WebsocketProtocol;
 
 void* create_board();
 class AudioCodec;
@@ -50,6 +54,9 @@ public:
     virtual void SetPowerSaveMode(bool enabled) = 0;
     virtual std::string GetBoardJson() = 0;
     virtual std::string GetDeviceStatusJson() = 0;
+    
+    // 获取websocket协议实例
+    virtual WebsocketProtocol* GetWebsocketProtocol();
 };
 
 #define DECLARE_BOARD(BOARD_CLASS_NAME) \

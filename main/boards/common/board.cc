@@ -3,6 +3,8 @@
 #include "settings.h"
 #include "display/display.h"
 #include "assets/lang_config.h"
+#include "application.h"
+#include "protocols/websocket_protocol.h"
 
 #include <esp_log.h>
 #include <esp_ota_ops.h>
@@ -159,4 +161,9 @@ std::string Board::GetJson() {
     // Close the JSON object
     json += R"(})";
     return json;
+}
+
+WebsocketProtocol* Board::GetWebsocketProtocol() {
+    // 通过Application获取websocket协议实例
+    return Application::GetInstance().GetWebsocketProtocol();
 }

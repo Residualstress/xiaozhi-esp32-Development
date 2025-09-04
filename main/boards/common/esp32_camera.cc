@@ -3,25 +3,46 @@
 #include "display.h"
 #include "board.h"
 #include "system_info.h"
+#include "websocket_protocol.h"
 
 #include <esp_log.h>
 #include <esp_heap_caps.h>
 #include <img_converters.h>
 #include <cstring>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #define TAG "Esp32Camera"
 
 Esp32Camera::Esp32Camera(const camera_config_t& config) {
+    config_copy_ = config;
     // camera init
-    esp_err_t err = esp_camera_init(&config); // 配置上面定义的参数
+    esp_err_t err = esp_camera_init(&config_copy_); // 配置上面定义的参数
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Camera init failed with error 0x%x", err);
         return;
     }
+    inited_ = true;
 
     sensor_t *s = esp_camera_sensor_get(); // 获取摄像头型号
-    if (s->id.PID == GC0308_PID) {
-        s->set_hmirror(s, 0);  // 这里控制摄像头镜像 写1镜像 写0不镜像
+    if (s) {
+        ESP_LOGI(TAG, "Camera sensor initialized successfully");
+        ESP_LOGI(TAG, "Sensor ID: PID=0x%04X, VER=0x%04X", s->id.PID, s->id.VER);
+        
+        if (s->id.PID == GC0308_PID) {
+            ESP_LOGI(TAG, "GC0308 sensor detected, setting mirror");
+            s->set_hmirror(s, 0);  // 这里控制摄像头镜像 写1镜像 写0不镜像
+        } else {
+            ESP_LOGW(TAG, "Unknown sensor PID: 0x%04X", s->id.PID);
+        }
+
+        // 同步传感器状态，确保分辨率/质量与当前配置匹配
+        // 注意：质量参数主要影响硬件JPEG模式；RGB565模式下无明显作用，但保留以便切回JPEG时生效
+        s->set_framesize(s, config_copy_.frame_size);
+        s->set_quality(s, 14);
+    } else {
+        ESP_LOGE(TAG, "Failed to get camera sensor");
+        return;
     }
 
     // 初始化预览图片的内存
@@ -38,6 +59,10 @@ Esp32Camera::Esp32Camera(const camera_config_t& config) {
         case FRAMESIZE_VGA:
             preview_image_.header.w = 640;
             preview_image_.header.h = 480;
+            break;
+        case FRAMESIZE_QQVGA:
+            preview_image_.header.w = 160;
+            preview_image_.header.h = 120;
             break;
         case FRAMESIZE_QVGA:
             preview_image_.header.w = 320;
@@ -65,18 +90,19 @@ Esp32Camera::Esp32Camera(const camera_config_t& config) {
         ESP_LOGE(TAG, "Failed to allocate memory for preview image");
         return;
     }
+
+    // 丢弃上电后的若干帧，避免初始化不稳定导致超时或 NO-SOI
+    for (int i = 0; i < 8; ++i) {
+        camera_fb_t* warm_fb = esp_camera_fb_get();
+        if (warm_fb) {
+            esp_camera_fb_return(warm_fb);
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
 }
 
 Esp32Camera::~Esp32Camera() {
-    if (fb_) {
-        esp_camera_fb_return(fb_);
-        fb_ = nullptr;
-    }
-    if (preview_image_.data) {
-        heap_caps_free((void*)preview_image_.data);
-        preview_image_.data = nullptr;
-    }
-    esp_camera_deinit();
+    StopCamera();
 }
 
 void Esp32Camera::SetExplainUrl(const std::string& url, const std::string& token) {
@@ -112,19 +138,46 @@ bool Esp32Camera::Capture() {
         ESP_LOGE(TAG, "Preview image data is not initialized");
         return true;
     }
-    // 显示预览图片
-    auto display = Board::GetInstance().GetDisplay();
-    if (display != nullptr) {
-        auto src = (uint16_t*)fb_->buf;
-        auto dst = (uint16_t*)preview_image_.data;
-        size_t pixel_count = fb_->len / 2;
-        for (size_t i = 0; i < pixel_count; i++) {
-            // 交换每个16位字内的字节
-            dst[i] = __builtin_bswap16(src[i]);
+    // 若为 JPEG 模式则跳过 RGB565 预览拷贝
+    if (fb_->format == PIXFORMAT_RGB565) {
+        auto display = Board::GetInstance().GetDisplay();
+        if (display != nullptr) {
+            auto src = (uint16_t*)fb_->buf;
+            auto dst = (uint16_t*)preview_image_.data;
+            size_t pixel_count = fb_->len / 2;
+            for (size_t i = 0; i < pixel_count; i++) {
+                dst[i] = __builtin_bswap16(src[i]);
+            }
+            display->SetPreviewImage(&preview_image_);
         }
-        display->SetPreviewImage(&preview_image_);
     }
     return true;
+}
+
+bool Esp32Camera::StartCamera() {
+    if (inited_) return true;
+    ESP_LOGI(TAG, "StartCamera with SDA=%d SCL=%d", config_copy_.pin_sccb_sda, config_copy_.pin_sccb_scl);
+    esp_err_t err = esp_camera_init(&config_copy_);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Camera init failed with error 0x%x", err);
+        return false;
+    }
+    inited_ = true;
+    return true;
+}
+
+void Esp32Camera::StopCamera() {
+    if (!inited_) return;
+    if (fb_) {
+        esp_camera_fb_return(fb_);
+        fb_ = nullptr;
+    }
+    if (preview_image_.data) {
+        heap_caps_free((void*)preview_image_.data);
+        preview_image_.data = nullptr;
+    }
+    esp_camera_deinit();
+    inited_ = false;
 }
 bool Esp32Camera::SetHMirror(bool enabled) {
     sensor_t *s = esp_camera_sensor_get();
@@ -197,7 +250,7 @@ std::string Esp32Camera::Explain(const std::string& question) {
 
     // We spawn a thread to encode the image to JPEG
     encoder_thread_ = std::thread([this, jpeg_queue]() {
-        frame2jpg_cb(fb_, 80, [](void* arg, size_t index, const void* data, size_t len) -> unsigned int {
+        frame2jpg_cb(fb_, 50, [](void* arg, size_t index, const void* data, size_t len) -> unsigned int {
             auto jpeg_queue = (QueueHandle_t)arg;
             JpegChunk chunk = {
                 .data = (uint8_t*)heap_caps_aligned_alloc(16, len, MALLOC_CAP_SPIRAM),
@@ -299,4 +352,68 @@ std::string Esp32Camera::Explain(const std::string& question) {
     ESP_LOGI(TAG, "Explain image size=%dx%d, compressed size=%d, remain stack size=%d, question=%s\n%s",
         fb_->width, fb_->height, total_sent, remain_stack_size, question.c_str(), result.c_str());
     return result;
+}
+
+// 设置websocket协议引用
+void Esp32Camera::SetWebsocketProtocol(WebsocketProtocol* protocol) {
+    websocket_protocol_ = protocol;
+}
+
+// 开始推流
+bool Esp32Camera::StartStreaming(int fps, int quality) {
+    if (streaming_) {
+        ESP_LOGW(TAG, "推流已经在运行中");
+        return true;
+    }
+    
+    if (!inited_) {
+        ESP_LOGE(TAG, "摄像头未初始化，无法开始推流");
+        return false;
+    }
+    
+    streaming_ = true;
+    // 确保传感器参数与请求一致，避免取帧超时（尽量降低负载）
+    if (inited_) {
+        sensor_t *s = esp_camera_sensor_get();
+        if (s) {
+            s->set_framesize(s, FRAMESIZE_QQVGA);
+            s->set_quality(s, quality);
+        }
+        // 丢弃更多热身帧，确保进入稳定状态
+        for (int i = 0; i < 5; ++i) {
+            camera_fb_t* warm = esp_camera_fb_get();
+            if (warm) esp_camera_fb_return(warm);
+        }
+    }
+    
+    // 通知websocket协议保持连接
+    if (websocket_protocol_) {
+        websocket_protocol_->SetCameraStreaming(true);
+    }
+    
+    ESP_LOGI(TAG, "摄像头推流开始 - FPS: %d, 质量: %d", fps, quality);
+    ESP_LOGI(TAG, "注意：实际推流由MCP工具处理，这里只设置状态标志");
+    return true;
+}
+
+// 停止推流
+void Esp32Camera::StopStreaming() {
+    if (!streaming_) {
+        ESP_LOGW(TAG, "推流未在运行");
+        return;
+    }
+    
+    streaming_ = false;
+    
+    // 通知websocket协议恢复正常连接行为
+    if (websocket_protocol_) {
+        websocket_protocol_->SetCameraStreaming(false);
+    }
+    
+    ESP_LOGI(TAG, "摄像头推流停止");
+}
+
+// 检查是否正在推流
+bool Esp32Camera::IsStreaming() const {
+    return streaming_;
 }

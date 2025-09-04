@@ -8,6 +8,8 @@
 #include <cJSON.h>
 #include <esp_log.h>
 #include <arpa/inet.h>
+#include <chrono>
+#include <thread>
 #include "assets/lang_config.h"
 
 #define TAG "WS"
@@ -250,4 +252,48 @@ void WebsocketProtocol::ParseServerHello(const cJSON* root) {
     }
 
     xEventGroupSetBits(event_group_handle_, WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT);
+}
+
+bool WebsocketProtocol::ShouldKeepConnection() const {
+    return camera_streaming_;
+}
+
+bool WebsocketProtocol::SendKeepalive() {
+    if (!camera_streaming_ || websocket_ == nullptr || !websocket_->IsConnected()) {
+        return false;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_keepalive_time_);
+
+    // 每30秒发送一次保活消息
+    if (elapsed.count() >= 30) {
+        cJSON* root = cJSON_CreateObject();
+        cJSON_AddStringToObject(root, "type", "keepalive");
+        cJSON_AddStringToObject(root, "session_id", session_id_.c_str());
+        cJSON_AddStringToObject(root, "device_id", SystemInfo::GetMacAddress().c_str());
+        cJSON_AddStringToObject(root, "status", "camera_streaming");
+
+        auto json_str = cJSON_PrintUnformatted(root);
+        std::string message(json_str);
+        cJSON_free(json_str);
+        cJSON_Delete(root);
+
+        if (SendText(message)) {
+            last_keepalive_time_ = now;
+            ESP_LOGI(TAG, "发送摄像头推流保活消息");
+            return true;
+        }
+    }
+    return false;
+}
+
+void WebsocketProtocol::SetCameraStreaming(bool streaming) {
+    camera_streaming_ = streaming;
+    ESP_LOGI(TAG, "设置摄像头推流状态: %s", streaming ? "开启" : "关闭");
+}
+
+void WebsocketProtocol::SendMcpMessage(const std::string& payload) {
+    // 调用基类的默认实现
+    Protocol::SendMcpMessage(payload);
 }

@@ -9,16 +9,32 @@
 #include <algorithm>
 #include <cstring>
 #include <esp_pthread.h>
+#include <mbedtls/base64.h>
 
 #include "application.h"
 #include "display.h"
 #include "board.h"
+#include "application.h"
+#include "esp32_camera.h"
 
 #define TAG "MCP"
 
 #define DEFAULT_TOOLCALL_STACK_SIZE 6144
 
 McpServer::McpServer() {
+    // 建立摄像头和websocket协议的连接
+    auto& board = Board::GetInstance();
+    auto camera = board.GetCamera();
+    auto websocket_protocol = board.GetWebsocketProtocol();
+    
+    if (camera && websocket_protocol) {
+        // 将websocket协议实例设置到摄像头中
+        if (camera->IsEsp32Camera()) {
+            auto esp32_camera = static_cast<Esp32Camera*>(camera);
+            esp32_camera->SetWebsocketProtocol(websocket_protocol);
+            ESP_LOGI(TAG, "成功建立摄像头和websocket协议的连接");
+        }
+    }
 }
 
 McpServer::~McpServer() {
@@ -100,6 +116,124 @@ void McpServer::AddCommonTools() {
                 }
                 auto question = properties["question"].value<std::string>();
                 return camera->Explain(question);
+            });
+
+        // Camera MJPEG-like streaming over MCP (Base64 JPEG per frame)
+        static std::atomic<bool> s_cam_streaming{false};
+        static std::thread s_cam_thread;
+
+        AddTool("self.camera.stream.start",
+            "Start camera streaming over MCP. Frames are JPEG-Base64 chunks. Optional args: fps (1-15), quality (5-30).",
+            PropertyList({
+                Property("fps", kPropertyTypeInteger, 10, 1, 15),   // 默认1 FPS，接受1~15，回调中再收敛到<=2
+                Property("quality", kPropertyTypeInteger, 8, 5, 30)  // 默认8，接受5~30，回调中再收敛到<=8
+            }),
+            [camera](const PropertyList& properties) -> ReturnValue {
+                if (s_cam_streaming.load()) {
+                    return true;
+                }
+
+                int fps = properties["fps"].value<int>();
+                int quality = properties["quality"].value<int>();
+
+                // Try set sensor params if possible
+                sensor_t* s = esp_camera_sensor_get();
+                if (s) {
+                    if (s->set_quality) s->set_quality(s, quality);
+                    // 尝试重置摄像头状态，解决NO-SOI问题
+                    if (s->reset) {
+                        ESP_LOGI(TAG, "Resetting camera sensor before streaming");
+                        s->reset(s);
+                        vTaskDelay(pdMS_TO_TICKS(100));  // 等待重置完成
+                    }
+                }
+
+                // 使用新的推流管理功能
+                if (camera->IsEsp32Camera()) {
+                    auto esp32_camera = static_cast<Esp32Camera*>(camera);
+                    if (!esp32_camera->StartStreaming(fps, quality)) {
+                        return "{\"success\": false, \"message\": \"Failed to start camera streaming\"}";
+                    }
+                }
+
+                s_cam_streaming.store(true);
+                s_cam_thread = std::thread([fps, quality, camera]() {
+                    const int frame_interval_ms = 1000 / std::max(1, fps);
+                    int frame_count = 0;
+                    while (s_cam_streaming.load()) {
+                        camera_fb_t* fb = esp_camera_fb_get();
+                        if (!fb) {
+                            vTaskDelay(pdMS_TO_TICKS(10));
+                            continue;
+                        }
+
+                        uint8_t* jpg_buf = nullptr;
+                        size_t jpg_len = 0;
+                        bool need_free = false;
+                        if (fb->format == PIXFORMAT_JPEG) {
+                            jpg_buf = fb->buf;
+                            jpg_len = fb->len;
+                        } else {
+                            // 使用调用参数的质量系数，避免固定80导致帧过大
+                            if (frame2jpg(fb, quality, &jpg_buf, &jpg_len)) {
+                                need_free = true;
+                            } else {
+                                esp_camera_fb_return(fb);
+                                vTaskDelay(pdMS_TO_TICKS(frame_interval_ms));
+                                continue;
+                            }
+                        }
+
+                        // Base64 encode
+                        size_t out_len = (jpg_len * 4 / 3) + 4;
+                        std::string b64;
+                        b64.resize(out_len);
+                        size_t actual = 0;
+                        int ret = mbedtls_base64_encode((unsigned char*)b64.data(), b64.size(), &actual,
+                            (const unsigned char*)jpg_buf, jpg_len);
+                        if (ret == 0) {
+                            b64.resize(actual);
+                            // Build MCP message
+                            // {"type":"camera","event":"frame","mime":"image/jpeg","data":"..."}
+                            std::string payload = "{\"type\":\"camera\",\"event\":\"frame\",\"mime\":\"image/jpeg\",\"data\":\"";
+                            payload += b64;
+                            payload += "\"}";
+                            Application::GetInstance().SendMcpMessage(payload);
+                            // 每10帧打印一次统计，便于确认设备端确实在发送
+                            frame_count++;
+                            if (frame_count % 10 == 0) {
+                                ESP_LOGI(TAG, "MCP frames: %d, fb_len=%u, jpg_len=%u, b64_len=%u, q=%d, fps=%d",
+                                         frame_count, (unsigned)fb->len, (unsigned)jpg_len, (unsigned)actual, quality, fps);
+                            }
+                        }
+
+                        if (need_free && jpg_buf) free(jpg_buf);
+                        esp_camera_fb_return(fb);
+                        vTaskDelay(pdMS_TO_TICKS(frame_interval_ms));
+                    }
+                });
+                return true;
+            });
+
+        AddTool("self.camera.stream.stop",
+            "Stop camera streaming over MCP.",
+            PropertyList(),
+            [camera](const PropertyList& properties) -> ReturnValue {
+                if (!s_cam_streaming.load()) {
+                    return true;
+                }
+                s_cam_streaming.store(false);
+                if (s_cam_thread.joinable()) {
+                    s_cam_thread.join();
+                }
+                
+                // 使用新的推流管理功能
+                if (camera->IsEsp32Camera()) {
+                    auto esp32_camera = static_cast<Esp32Camera*>(camera);
+                    esp32_camera->StopStreaming();
+                }
+                
+                return true;
             });
     }
 

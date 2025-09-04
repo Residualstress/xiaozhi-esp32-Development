@@ -15,6 +15,8 @@
 #include "ota.h"
 #include "audio_service.h"
 #include "device_state_event.h"
+#include "protocols/websocket_protocol.h"
+#include "camera_connection.h"
 
 #define MAIN_EVENT_SCHEDULE (1 << 0)
 #define MAIN_EVENT_SEND_AUDIO (1 << 1)
@@ -59,6 +61,9 @@ public:
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
+    
+    // 获取websocket协议实例
+    WebsocketProtocol* GetWebsocketProtocol();
 
 private:
     Application();
@@ -69,6 +74,7 @@ private:
     std::unique_ptr<Protocol> protocol_;
     EventGroupHandle_t event_group_ = nullptr;
     esp_timer_handle_t clock_timer_handle_ = nullptr;
+    esp_timer_handle_t camera_keepalive_timer_handle_ = nullptr;
     volatile DeviceState device_state_ = kDeviceStateUnknown;
     ListeningMode listening_mode_ = kListeningModeAutoStop;
     AecMode aec_mode_ = kAecOff;
@@ -79,12 +85,17 @@ private:
     bool aborted_ = false;
     int clock_ticks_ = 0;
     TaskHandle_t check_new_version_task_handle_ = nullptr;
+    
+    // 摄像头连接管理器
+    std::unique_ptr<CameraConnection> camera_connection_;
 
     void OnWakeWordDetected();
     void CheckNewVersion(Ota& ota);
     void ShowActivationCode(const std::string& code, const std::string& message);
     void OnClockTimer();
+    void OnCameraKeepaliveTimer();
     void SetListeningMode(ListeningMode mode);
+    void InitializeCameraConnection();
 };
 
 #endif // _APPLICATION_H_

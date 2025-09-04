@@ -14,8 +14,13 @@
 #include <driver/gpio.h>
 #include <arpa/inet.h>
 #include <font_awesome.h>
+#include <thread>
+#include <chrono>
 
 #define TAG "Application"
+
+extern "C" void cam_http_server_start();
+extern "C" void cam_http_server_stop();
 
 
 static const char* const STATE_STRINGS[] = {
@@ -57,12 +62,29 @@ Application::Application() {
         .skip_unhandled_events = true
     };
     esp_timer_create(&clock_timer_args, &clock_timer_handle_);
+    
+    // 创建摄像头保活定时器
+    esp_timer_create_args_t camera_keepalive_timer_args = {
+        .callback = [](void* arg) {
+            Application* app = (Application*)arg;
+            app->OnCameraKeepaliveTimer();
+        },
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "camera_keepalive_timer",
+        .skip_unhandled_events = true
+    };
+    esp_timer_create(&camera_keepalive_timer_args, &camera_keepalive_timer_handle_);
 }
 
 Application::~Application() {
     if (clock_timer_handle_ != nullptr) {
         esp_timer_stop(clock_timer_handle_);
         esp_timer_delete(clock_timer_handle_);
+    }
+    if (camera_keepalive_timer_handle_ != nullptr) {
+        esp_timer_stop(camera_keepalive_timer_handle_);
+        esp_timer_delete(camera_keepalive_timer_handle_);
     }
     vEventGroupDelete(event_group_);
 }
@@ -351,6 +373,9 @@ void Application::Start() {
 
     /* Start the clock timer to update the status bar */
     esp_timer_start_periodic(clock_timer_handle_, 1000000);
+    
+    /* Start the camera keepalive timer */
+    esp_timer_start_periodic(camera_keepalive_timer_handle_, 30000000);  // 30秒间隔
 
     /* Wait for the network to be ready */
     board.StartNetwork();
@@ -498,6 +523,9 @@ void Application::Start() {
 
     SetDeviceState(kDeviceStateIdle);
 
+    // Start lightweight HTTP server for camera streaming
+    cam_http_server_start();
+
     has_server_time_ = ota.HasServerTime();
     if (protocol_started) {
         std::string message = std::string(Lang::Strings::VERSION) + ota.GetCurrentVersion();
@@ -507,21 +535,28 @@ void Application::Start() {
         audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS);
     }
 
+    // 初始化摄像头连接管理器
+    InitializeCameraConnection();
+    
     // Print heap stats
     SystemInfo::PrintHeapStats();
 }
 
 void Application::OnClockTimer() {
     clock_ticks_++;
+    if (clock_ticks_ % 60 == 0) {  // 每分钟执行一次
+        auto display = Board::GetInstance().GetDisplay();
+        if (display != nullptr) {
+            display->UpdateStatusBar(true);
+        }
+    }
+}
 
-    auto display = Board::GetInstance().GetDisplay();
-    display->UpdateStatusBar();
-
-    // Print the debug info every 10 seconds
-    if (clock_ticks_ % 10 == 0) {
-        // SystemInfo::PrintTaskCpuUsage(pdMS_TO_TICKS(1000));
-        // SystemInfo::PrintTaskList();
-        SystemInfo::PrintHeapStats();
+void Application::OnCameraKeepaliveTimer() {
+    // 检查websocket协议是否需要发送保活消息
+    auto websocket_protocol = GetWebsocketProtocol();
+    if (websocket_protocol) {
+        websocket_protocol->SendKeepalive();
     }
 }
 
@@ -738,6 +773,17 @@ bool Application::CanEnterSleepMode() {
 
 void Application::SendMcpMessage(const std::string& payload) {
     Schedule([this, payload]() {
+        // 优先使用摄像头连接发送MCP消息
+        if (camera_connection_ && camera_connection_->IsConnected()) {
+            if (camera_connection_->SendMcpMessage(payload)) {
+                ESP_LOGI(TAG, "MCP message sent via camera connection: %s", payload.c_str());
+                return;
+            } else {
+                ESP_LOGW(TAG, "Failed to send MCP message via camera connection, falling back to main protocol");
+            }
+        }
+        
+        // 回退到主协议
         if (protocol_) {
             protocol_->SendMcpMessage(payload);
         }
@@ -773,4 +819,55 @@ void Application::SetAecMode(AecMode mode) {
 
 void Application::PlaySound(const std::string_view& sound) {
     audio_service_.PlaySound(sound);
+}
+
+WebsocketProtocol* Application::GetWebsocketProtocol() {
+    // 检查当前协议是否为WebsocketProtocol类型
+    if (protocol_ && protocol_->IsWebsocketProtocol()) {
+        return static_cast<WebsocketProtocol*>(protocol_.get());
+    }
+    return nullptr;
+}
+
+void Application::InitializeCameraConnection() {
+    ESP_LOGI(TAG, "Initializing camera connection manager");
+    
+    // 创建摄像头连接管理器
+    camera_connection_ = std::make_unique<CameraConnection>();
+    
+    // 设置连接回调
+    camera_connection_->SetOnConnected([this]() {
+        ESP_LOGI(TAG, "Camera connection established");
+        // 可以在这里添加连接成功后的处理逻辑
+    });
+    
+    camera_connection_->SetOnDisconnected([this]() {
+        ESP_LOGI(TAG, "Camera connection lost");
+        // 可以在这里添加连接断开后的处理逻辑
+    });
+    
+    camera_connection_->SetOnMessage([this](const std::string& message) {
+        ESP_LOGD(TAG, "Received camera message: %s", message.c_str());
+        // 将摄像头连接收到的消息也交给 MCP Server 处理
+        cJSON* root = cJSON_Parse(message.c_str());
+        if (root) {
+            auto type = cJSON_GetObjectItem(root, "type");
+            if (cJSON_IsString(type) && strcmp(type->valuestring, "mcp") == 0) {
+                auto payload = cJSON_GetObjectItem(root, "payload");
+                if (cJSON_IsObject(payload)) {
+                    McpServer::GetInstance().ParseMessage(payload);
+                }
+            }
+            cJSON_Delete(root);
+        }
+    });
+    
+    // 延迟2秒后启动摄像头连接
+    std::thread([this]() {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        ESP_LOGI(TAG, "Starting camera connection after 2 seconds delay");
+        camera_connection_->Start();
+    }).detach();
+    
+    ESP_LOGI(TAG, "Camera connection manager initialized");
 }
